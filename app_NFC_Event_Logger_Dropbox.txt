@@ -1,0 +1,10 @@
+NFC_Event_Logger
+1cexxbkpe4j1hbt
+
+
+
+============================================================
+ SUCCESS! Here is your refresh token:
+============================================================
+
+T2rdDNkf6Q8AAAAAAAAAASs-fNE8nkC3IxeXwZxh865KHD7sdf3-IuXOuHCp_9xl
