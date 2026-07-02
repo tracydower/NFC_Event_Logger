@@ -15,6 +15,8 @@ Each row that gets logged contains:
     - timestamp_utc    (when the tap happened, in UTC)
     - timestamp_local  (same moment, in your local timezone)
     - tag              (the tag name you send from Shortcuts, e.g. "front door")
+    - source           (where it came from: NFC, Voice, Text, Email, ...)
+                       If a sender doesn't specify one, it defaults to "NFC".
 
 Environment variables (see .env.example):
     API_TOKEN               A secret you make up. Shortcuts must send it so
@@ -51,7 +53,11 @@ DROPBOX_REFRESH_TOKEN = os.environ.get("DROPBOX_REFRESH_TOKEN", "")
 DROPBOX_FILE_PATH = os.environ.get("DROPBOX_FILE_PATH", "/nfc_log.xlsx")
 TIMEZONE = os.environ.get("TIMEZONE", "America/Chicago")
 
-HEADERS = ["timestamp_utc", "timestamp_local", "tag"]
+HEADERS = ["timestamp_utc", "timestamp_local", "tag", "source"]
+
+# If a request doesn't say where it came from, assume it was an NFC tap
+# (that's the only sender that existed before the source column was added).
+DEFAULT_SOURCE = "NFC"
 
 app = Flask(__name__)
 
@@ -120,11 +126,27 @@ def upload_workbook(dbx, wb):
     )
 
 
-def append_row(tag, when_utc):
-    """Append a single (timestamp, tag) row to the Dropbox spreadsheet."""
+def ensure_header(ws):
+    """Make sure row 1 matches HEADERS.
+
+    Older spreadsheets were created before the "source" column existed, so
+    their header row only has three columns. This quietly upgrades the header
+    to include "source" without disturbing any existing data rows.
+    """
+    for col_index, title in enumerate(HEADERS, start=1):
+        cell = ws.cell(row=1, column=col_index)
+        if cell.value != title:
+            cell.value = title
+
+
+def append_row(tag, source, when_utc):
+    """Append a single (timestamp, tag, source) row to the Dropbox spreadsheet."""
     dbx = get_dropbox_client()
     wb = download_workbook(dbx)
     ws = wb.active
+
+    # Upgrade the header if this sheet predates the source column.
+    ensure_header(ws)
 
     # Build the local-time string.
     if ZoneInfo is not None:
@@ -139,6 +161,7 @@ def append_row(tag, when_utc):
         when_utc.strftime("%Y-%m-%d %H:%M:%S"),
         local_dt.strftime("%Y-%m-%d %H:%M:%S"),
         tag,
+        source,
     ])
     upload_workbook(dbx, wb)
 
@@ -187,16 +210,21 @@ def log_event():
     if not tag:
         return jsonify({"error": "missing 'tag'"}), 400
 
+    # Where did this come from? NFC / Voice / Text / Email / ...
+    # If the sender didn't say, assume NFC (keeps old automations working).
+    source = field("source") or DEFAULT_SOURCE
+
     when_utc = datetime.now(timezone.utc)
 
     try:
-        append_row(str(tag), when_utc)
+        append_row(str(tag), str(source), when_utc)
     except Exception as exc:  # noqa: BLE001 - report any failure to the caller
         return jsonify({"error": str(exc)}), 500
 
     return jsonify({
         "status": "logged",
         "tag": tag,
+        "source": source,
         "timestamp_utc": when_utc.strftime("%Y-%m-%d %H:%M:%S"),
     })
 
