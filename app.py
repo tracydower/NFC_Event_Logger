@@ -1,31 +1,5 @@
-"""
-NFC → Dropbox spreadsheet logger
-=================================
-
-A tiny web service that receives an event from the iPhone Shortcuts
-("Automations") app when you tap an NFC tag, and appends a row to a
-spreadsheet (.xlsx) stored in your Dropbox.
-
-Flow:
-    Tap NFC tag  ->  Shortcuts automation  ->  HTTP POST to /log  ->  this app
-                                                                        |
-                                                        appends a row to Dropbox xlsx
-
-Each row that gets logged contains:
-    - timestamp_utc    (when the tap happened, in UTC)
-    - timestamp_local  (same moment, in your local timezone)
-    - tag              (the tag name you send from Shortcuts, e.g. "front door")
-    - source           (where it came from: NFC, Voice, Text, Email, ...)
-                       If a sender doesn't specify one, it defaults to "NFC".
-
-Environment variables (see .env.example):
-    API_TOKEN               A secret you make up. Shortcuts must send it so
-                            strangers can't write to your sheet.
-    DROPBOX_APP_KEY         From the Dropbox App Console.
-    DROPBOX_APP_SECRET      From the Dropbox App Console.
-    DROPBOX_REFRESH_TOKEN   Produced once by running get_refresh_token.py.
-    DROPBOX_FILE_PATH       Where to store the sheet in Dropbox, e.g. /nfc_log.xlsx
-    TIMEZONE                IANA tz name for the local column, e.g. America/Chicago
+""" Tiny web service to log event to csv on the user's Dropbox.
+ HTTP POST to /log  ->  this app  -> appends a row to Dropbox csv
 """
 
 import io
@@ -41,36 +15,25 @@ except ImportError:  # pragma: no cover
 import dropbox
 from dropbox.files import WriteMode
 from flask import Flask, jsonify, request
-from openpyxl import Workbook, load_workbook
+import csv
 
-# ---------------------------------------------------------------------------
-# Configuration (read once at startup)
-# ---------------------------------------------------------------------------
-API_TOKEN = os.environ.get("API_TOKEN", "")
-DROPBOX_APP_KEY = os.environ.get("DROPBOX_APP_KEY", "")
-DROPBOX_APP_SECRET = os.environ.get("DROPBOX_APP_SECRET", "")
-DROPBOX_REFRESH_TOKEN = os.environ.get("DROPBOX_REFRESH_TOKEN", "")
-DROPBOX_FILE_PATH = os.environ.get("DROPBOX_FILE_PATH", "/nfc_log.xlsx")
-TIMEZONE = os.environ.get("TIMEZONE", "America/Chicago")
-
-HEADERS = ["timestamp_utc", "timestamp_local", "tag", "source"]
-
-# If a request doesn't say where it came from, assume it was an NFC tap
-# (that's the only sender that existed before the source column was added).
-DEFAULT_SOURCE = "NFC"
+# __ Configuration (read once at startup) ____________________________________
+API_TOKEN = os.environ.get("API_TOKEN", "")                                 # A secret you make up. Shortcuts must send it so strangers can't write to your sheet.
+DROPBOX_APP_KEY = os.environ.get("DROPBOX_APP_KEY", "")                     # From the Dropbox App Console.
+DROPBOX_APP_SECRET = os.environ.get("DROPBOX_APP_SECRET", "")               # From the Dropbox App Console.
+DROPBOX_REFRESH_TOKEN = os.environ.get("DROPBOX_REFRESH_TOKEN", "")         # Produced once by running get_refresh_token.py.
+DROPBOX_FILE_PATH = os.environ.get("DROPBOX_FILE_PATH", "/quick_log.csv")   # Where to store the CSV in Dropbox
+TIMEZONE = os.environ.get("TIMEZONE", "America/Chicago")                    # IANA tz name for the local column. If not set, assume CST/CDT.
+HEADERS = ["timestamp_utc", "timestamp_local", "source", "event", "tag_1", "tag_2", "tag_3"]
+DEFAULT_SOURCE = "NFC"                                                      # If a request doesn't say where it came from, assume it was an NFC tap
 
 app = Flask(__name__)
 
 
-# ---------------------------------------------------------------------------
-# Dropbox helpers
-# ---------------------------------------------------------------------------
+# __ Dropbox helpers ____________________________________
 def get_dropbox_client():
     """Return an authenticated Dropbox client.
-
-    We use a refresh token so the app can keep working forever without you
-    having to log in again. The SDK automatically trades the refresh token
-    for a fresh short-lived access token as needed.
+    Automatically trades the refresh token for a fresh short-lived access token as needed.
     """
     missing = [
         name
@@ -82,10 +45,7 @@ def get_dropbox_client():
         if not value
     ]
     if missing:
-        raise RuntimeError(
-            "Missing Dropbox config: " + ", ".join(missing) +
-            ". Set these environment variables (see README)."
-        )
+        raise RuntimeError("Missing Dropbox config: " + ", ".join(missing) + ". Set these environment variables (see README).")
 
     return dropbox.Dropbox(
         oauth2_refresh_token=DROPBOX_REFRESH_TOKEN,
@@ -94,59 +54,42 @@ def get_dropbox_client():
     )
 
 
-def download_workbook(dbx):
-    """Download the existing spreadsheet, or create a fresh one with headers."""
+def download_rows(dbx):
+    """Get the CSV as a list of rows. If the file doesn't exist yet, start with just the header."""
     try:
         _metadata, response = dbx.files_download(DROPBOX_FILE_PATH)
-        return load_workbook(io.BytesIO(response.content))
+        text = response.content.decode("utf-8")          # bytes -> text
+        return list(csv.reader(io.StringIO(text)))       # text  -> list of rows
     except dropbox.exceptions.ApiError as err:
-        # File doesn't exist yet -> start a new workbook with a header row.
-        is_not_found = (
-            err.error.is_path()
-            and err.error.get_path().is_not_found()
-        )
-        if is_not_found:
-            wb = Workbook()
-            ws = wb.active
-            ws.title = "log"
-            ws.append(HEADERS)
-            return wb
+        if err.error.is_path() and err.error.get_path().is_not_found():
+            return [HEADERS]                             # brand-new file = header only
         raise
 
 
-def upload_workbook(dbx, wb):
-    """Upload the workbook back to Dropbox, overwriting the old copy."""
-    buffer = io.BytesIO()
-    wb.save(buffer)
-    buffer.seek(0)
+def upload_rows(dbx, rows):
+    """Turn the list of rows back into CSV text and upload it, replacing the old file."""
+    buffer = io.StringIO()
+    csv.writer(buffer).writerows(rows)                   # list of rows -> text
     dbx.files_upload(
-        buffer.read(),
+        buffer.getvalue().encode("utf-8"),               # text -> bytes
         DROPBOX_FILE_PATH,
         mode=WriteMode.overwrite,
     )
 
 
-def ensure_header(ws):
-    """Make sure row 1 matches HEADERS.
+def append_row(event, source, tags, when_utc):
+    """Append one row to the Dropbox CSV.
 
-    Older spreadsheets were created before the "source" column existed, so
-    their header row only has three columns. This quietly upgrades the header
-    to include "source" without disturbing any existing data rows.
+    tags is a list of three strings [tag_1, tag_2, tag_3]; any of them may be "".
     """
-    for col_index, title in enumerate(HEADERS, start=1):
-        cell = ws.cell(row=1, column=col_index)
-        if cell.value != title:
-            cell.value = title
-
-
-def append_row(tag, source, when_utc):
-    """Append a single (timestamp, tag, source) row to the Dropbox spreadsheet."""
     dbx = get_dropbox_client()
-    wb = download_workbook(dbx)
-    ws = wb.active
+    rows = download_rows(dbx)
 
-    # Upgrade the header if this sheet predates the source column.
-    ensure_header(ws)
+    # Keep the header row correct (also upgrades an older/short header).
+    if rows and rows[0] and rows[0][0] == "timestamp_utc":
+        rows[0] = HEADERS
+    else:
+        rows.insert(0, HEADERS)
 
     # Build the local-time string.
     if ZoneInfo is not None:
@@ -157,18 +100,18 @@ def append_row(tag, source, when_utc):
     else:
         local_dt = when_utc
 
-    ws.append([
+    # Column order must match HEADERS: utc, local, source, event, tag_1, tag_2, tag_3
+    rows.append([
         when_utc.strftime("%Y-%m-%d %H:%M:%S"),
         local_dt.strftime("%Y-%m-%d %H:%M:%S"),
-        tag,
         source,
+        event,
+        tags[0], tags[1], tags[2],
     ])
-    upload_workbook(dbx, wb)
+    upload_rows(dbx, rows)
 
 
-# ---------------------------------------------------------------------------
-# Routes
-# ---------------------------------------------------------------------------
+# __ Routes ____________________________________
 @app.get("/")
 def health():
     """Simple health check so you can confirm the service is running."""
@@ -177,13 +120,14 @@ def health():
 
 @app.post("/log")
 def log_event():
-    """Receive an NFC event from Shortcuts and append a row to Dropbox.
-
+    """Receive an event and append a row to Dropbox.
     Accepts either JSON body or form fields:
-        tag    (required)  the tag name, e.g. "front door"
-        token  (required)  must equal API_TOKEN
+        token   (required)  must equal API_TOKEN
+        event   (required)  the event name, e.g. "Did a task"
+        source  (optional)  NFC / Voice / Text / Email ... (defaults to NFC)
+        tag_1, tag_2, tag_3 (optional) extra values, e.g. "Cost:$69.22"
     The token may also be sent as a query string (?token=...) or an
-    "Authorization: Bearer <token>" header, whichever is easiest in Shortcuts.
+    "Authorization: Bearer <token>" header, whichever is easiest.
     """
     # Pull values from JSON, form, or query string — whichever is present.
     data = request.get_json(silent=True) or {}
@@ -206,25 +150,31 @@ def log_event():
     if token != API_TOKEN:
         return jsonify({"error": "unauthorized"}), 401
 
-    tag = field("tag")
-    if not tag:
-        return jsonify({"error": "missing 'tag'"}), 400
+    event = field("event")
+    if not event:
+        return jsonify({"error": "missing 'event'"}), 400
 
     # Where did this come from? NFC / Voice / Text / Email / ...
-    # If the sender didn't say, assume NFC (keeps old automations working).
+    # If the sender didn't say, assume NFC.
     source = field("source") or DEFAULT_SOURCE
+
+    # Extra optional tags. If a tag wasn't sent, store an empty cell.
+    tag_1 = field("tag_1") or ""
+    tag_2 = field("tag_2") or ""
+    tag_3 = field("tag_3") or ""
 
     when_utc = datetime.now(timezone.utc)
 
     try:
-        append_row(str(tag), str(source), when_utc)
+        append_row(str(event), str(source), [tag_1, tag_2, tag_3], when_utc)
     except Exception as exc:  # noqa: BLE001 - report any failure to the caller
         return jsonify({"error": str(exc)}), 500
 
     return jsonify({
         "status": "logged",
-        "tag": tag,
+        "event": event,
         "source": source,
+        "tags": [tag_1, tag_2, tag_3],
         "timestamp_utc": when_utc.strftime("%Y-%m-%d %H:%M:%S"),
     })
 
