@@ -118,10 +118,11 @@ def health():
     return jsonify({"status": "ok", "service": "nfc-dropbox-logger"})
 
 
-@app.post("/log")
+@app.route("/log", methods=["GET", "POST"])
 def log_event():
     """Receive an event and append a row to Dropbox.
-    Accepts either JSON body or form fields:
+    Accepts GET (handy for testing by pasting a URL in a browser) or POST.
+    Values come from JSON body, form fields, OR the query string (?event=...):
         token   (required)  must equal API_TOKEN
         event   (required)  the event name, e.g. "Did a task"
         source  (optional)  NFC / Voice / Text / Email ... (defaults to NFC)
