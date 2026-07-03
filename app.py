@@ -24,7 +24,7 @@ DROPBOX_APP_SECRET = os.environ.get("DROPBOX_APP_SECRET", "")               # Fr
 DROPBOX_REFRESH_TOKEN = os.environ.get("DROPBOX_REFRESH_TOKEN", "")         # Produced once by running get_refresh_token.py.
 DROPBOX_FILE_PATH = os.environ.get("DROPBOX_FILE_PATH", "/quick_log.csv")   # Where to store the CSV in Dropbox
 TIMEZONE = os.environ.get("TIMEZONE", "America/Chicago")                    # IANA tz name for the local column. If not set, assume CST/CDT.
-HEADERS = ["timestamp_utc", "timestamp_local", "source", "event", "tag_1", "tag_2", "tag_3"]
+HEADERS = ["timestamp_utc", "timestamp_local", "s", "e", "a", "b", "c"]
 DEFAULT_SOURCE = "NFC"                                                      # If a request doesn't say where it came from, assume it was an NFC tap
 
 app = Flask(__name__)
@@ -141,7 +141,7 @@ def log_event():
         )
 
     # Token can arrive several ways; accept the most convenient.
-    token = field("token")
+    token = field("k")
     auth_header = request.headers.get("Authorization", "")
     if not token and auth_header.lower().startswith("bearer "):
         token = auth_header[7:].strip()
@@ -151,18 +151,18 @@ def log_event():
     if token != API_TOKEN:
         return jsonify({"error": "unauthorized"}), 401
 
-    event = field("event")
+    event = field("e")
     if not event:
         return jsonify({"error": "missing 'event'"}), 400
 
     # Where did this come from? NFC / Voice / Text / Email / ...
     # If the sender didn't say, assume NFC.
-    source = field("source") or DEFAULT_SOURCE
+    source = field("s") or DEFAULT_SOURCE
 
     # Extra optional tags. If a tag wasn't sent, store an empty cell.
-    tag_1 = field("tag_1") or ""
-    tag_2 = field("tag_2") or ""
-    tag_3 = field("tag_3") or ""
+    tag_1 = field("a") or ""
+    tag_2 = field("b") or ""
+    tag_3 = field("c") or ""
 
     when_utc = datetime.now(timezone.utc)
 
