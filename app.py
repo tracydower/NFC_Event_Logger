@@ -59,7 +59,11 @@ def download_rows(dbx):
     """Get the CSV as a list of rows. If the file doesn't exist yet, start with just the header."""
     try:
         _metadata, response = dbx.files_download(DROPBOX_FILE_PATH)
-        text = response.content.decode("utf-8")          # bytes -> text
+        try:
+            text = response.content.decode("utf-8")
+        except UnicodeDecodeError:
+            text = response.content.decode("cp1252")
+
         return list(csv.reader(io.StringIO(text)))       # text  -> list of rows
     except dropbox.exceptions.ApiError as err:
         if err.error.is_path() and err.error.get_path().is_not_found():
