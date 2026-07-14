@@ -1,4 +1,4 @@
-""" Tiny web service to log event to csv on the user's Dropbox.
+""" Tiny web service to log a row to csv on the user's Dropbox.
  HTTP POST to /log  ->  this app  -> appends a row to Dropbox csv
 """
 
@@ -6,9 +6,9 @@ import io
 import os
 from datetime import datetime, timezone
 # __ Configuration (read once at startup) ____________________________________
-HEADERS = ["timestamp_local", "s", "e"]
+HEADERS = ["timestamp_local", "s"]
 DEFAULT_SOURCE = "NFC"                                                # If a request doesn't say where it came from, assume it was an NFC tap
-
+TIMESTAMP_STYLE = "%Y-%m-%d %H:%M:%S"
 API_TOKEN = os.environ.get("API_TOKEN", "")                           # A secret you make up. Shortcuts must send it so strangers can't write to your sheet.
 DROPBOX_APP_KEY = os.environ.get("DROPBOX_APP_KEY", "")               # From the Dropbox App Console.
 DROPBOX_APP_SECRET = os.environ.get("DROPBOX_APP_SECRET", "")         # From the Dropbox App Console.
@@ -81,8 +81,16 @@ def upload_rows(dbx, rows):
         mode=WriteMode.overwrite,
     )
 
+def _ts(row):
+        for fmt in (TIMESTAMP_STYLE, "%Y-%m-%d %H:%M:%S", "%m/%d/%Y %H:%M:%S", "%m/%d/%Y %H:%M"):
+            try:
+                return datetime.strptime(row[0], fmt)
+            except (ValueError, IndexError):
+                continue
+        return datetime.min   # unparseable rows sink to the bottom
 
-def append_row(event, source, when_utc):
+
+def append_row(source, when_utc):
     """Append one row to the Dropbox CSV.
     """
     dbx = get_dropbox_client()
@@ -97,13 +105,12 @@ def append_row(event, source, when_utc):
     # Build the local-time string.
     timestamp_local = when_utc.astimezone(ZoneInfo(TIMEZONE))
 
-    # Column order must match HEADERS: timestamp_local, source, event
-    rows.append([
-        timestamp_local.strftime("%Y-%m-%d %H:%M:%S"),
-        source,
-        event
-    ])
-    rows[1:] = sorted(rows[1:], key=lambda row: row[0], reverse=True)
+    # Column order must match HEADERS: timestamp_local, source
+    # rows.append([timestamp_local.strftime("%Y-%m-%d %H:%M:%S"),source])
+    rows.append([timestamp_local.strftime(TIMESTAMP_STYLE),source])
+    # rows[1:] = sorted(rows[1:], key=lambda row: row[0], reverse=True)
+    rows[1:] = sorted(rows[1:], key=_ts, reverse=True)
+
     upload_rows(dbx, rows)
 
 
@@ -114,13 +121,12 @@ def health():
     return jsonify({"status": "ok", "service": "nfc-dropbox-logger"})
 
 @app.route("/log", methods=["GET", "POST"])
-def log_event():
-    """Receive an event and append a row to Dropbox.
+def add_row_to_file():
+    """Receive an blob and append a row to Dropbox.
     Accepts GET (handy for testing by pasting a URL in a browser) or POST.
-    Values come from JSON body, form fields, OR the query string (?event=...):
+    Values come from JSON body, form fields, OR the query string (?k=myrealtoken&s=blob......):
         token  (required)  must equal API_TOKEN
-        source (required)  NFC, Voice, Text, Email, etc.
-        event  (required)  "a blob I parse later"
+        source (required)  BLOB to parse later.
     The token may also be sent as a query string (?token=...) or an
     "Authorization: Bearer <token>" header, whichever is easiest.
     """
@@ -144,10 +150,6 @@ def log_event():
         return jsonify({"error": "server missing API_TOKEN config"}), 500
     if token != API_TOKEN:
         return jsonify({"error": "unauthorized"}), 401
-
-    event = field("e")
-    if not event:
-        return jsonify({"error": "missing 'event'"}), 400
     
     # Where did this come from? NFC, Voice, Text, Email, etc.
     # source = field("s") or DEFAULT_SOURCE # If the sender didn't say, assume NFC.
@@ -158,16 +160,11 @@ def log_event():
     when_utc = datetime.now(timezone.utc)
 
     try:
-        append_row(str(event), str(source), when_utc)
+        append_row(str(source), when_utc)
     except Exception as exc:  # noqa: BLE001 - report any failure to the caller
         return jsonify({"error": str(exc)}), 500
 
-    return jsonify({
-        "status": "logged",
-        "event": event,
-        "source": source,
-        "timestamp_utc": when_utc.strftime("%Y-%m-%d %H:%M:%S"),
-    })
+    return jsonify({"status": "logged","source": source,"timestamp_utc": when_utc.strftime(TIMESTAMP_STYLE),})
 
 if __name__ == "__main__":
     # Local development server. In production, gunicorn runs the app (see Procfile).
