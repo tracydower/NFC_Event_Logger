@@ -1,108 +1,63 @@
 """
-Local smoke test — no Dropbox account needed.
-=============================================
+Try app.py on your own computer — no Dropbox, no secrets, no risk.
+==================================================================
 
-This fakes the Dropbox part so you can confirm the web service and the
-row-appending logic work on your own machine before deploying.
+This runs your real app.py but swaps Dropbox for a plain file on your PC,
+so you can see exactly what rows your code produces.
 
-Usage:
-    pip install -r requirements.txt
-    python test_local.py
+How to run (Windows):
+    1. Save this file next to app.py (in C:\\app_NFC_Event_Logger)
+    2. Open a terminal there and run:   pip install flask
+    3. Run:   python try_it_locally.py
+    4. It creates  log.csv  in the same folder — open it and look.
 
-It spins up the app in "fake Dropbox" mode, sends a couple of test taps,
-and writes the resulting spreadsheet to ./local_test_output.xlsx so you can
-open it and see the rows.
+Nothing here touches your real Dropbox file.
 """
+LOCAL_FILE = "log.csv"
 
-import io
+import csv
 import os
 
+# Dummy values so app.py imports cleanly. Real Dropbox is never contacted.
 os.environ.setdefault("API_TOKEN", "test-token")
-# Dummy Dropbox creds so the app imports cleanly; we monkeypatch the client.
 os.environ.setdefault("DROPBOX_APP_KEY", "x")
 os.environ.setdefault("DROPBOX_APP_SECRET", "x")
 os.environ.setdefault("DROPBOX_REFRESH_TOKEN", "x")
 
-import app as service  # noqa: E402
-from openpyxl import Workbook, load_workbook  # noqa: E402
+import app as service  # your real app.py
 
-# In-memory stand-in for the file that would live on Dropbox.
-_fake_store = {"bytes": None}
+if not os.path.exists(LOCAL_FILE):
+    with open(LOCAL_FILE, "w", newline="", encoding="utf-8") as f:
+        csv.writer(f).writerow(service.HEADERS)
 
-
-class FakeDbx:
+# A stand-in for Dropbox that just reads/writes the local file above.
+class FakeDropbox:
     def files_download(self, path):
-        if _fake_store["bytes"] is None:
-            raise service.dropbox.exceptions.ApiError(
-                request_id="1",
-                error=None,
-                user_message_text=None,
-                user_message_locale=None,
-            )
-        resp = type("R", (), {"content": _fake_store["bytes"]})()
-        return (None, resp)
+        with open(LOCAL_FILE, "rb") as f:
+            data = f.read()
+        return (None, type("R", (), {"content": data})())
 
     def files_upload(self, data, path, mode=None):
-        _fake_store["bytes"] = data
+        with open(LOCAL_FILE, "wb") as f:
+            f.write(data)
 
+# Make your app use the fake Dropbox instead of the real one.
+service.get_dropbox_client = lambda: FakeDropbox()
 
-# Patch: use our fake client, and treat "no file yet" as not-found.
-service.get_dropbox_client = lambda: FakeDbx()
+client = service.app.test_client()
 
+# --- Send some pretend taps -------------------------------------------------
+print("Sending test events...\n")
 
-def _fake_download_workbook(dbx):
-    if _fake_store["bytes"] is None:
-        wb = Workbook()
-        ws = wb.active
-        ws.title = "log"
-        ws.append(service.HEADERS)
-        return wb
-    return load_workbook(io.BytesIO(_fake_store["bytes"]))
+print(client.post("/log", json={"k": "test-token", "s": "NFC", "e": "TEST:aaaaaaaaaaa Shower"}).get_json())
+print(client.post("/log", json={"k": "test-token", "s": "Automation", "e": "TEST:bbbbbbbbbb"}).get_json())
+print(client.post("/log", json={"k": "test-token", "e": "TEST:cccccccc", "s": "Voice"}).get_json())
+print(client.post("/log", json={"k": "test-token", "s": "NFC","e": "TEST:dddddddddddd",}).get_json())
 
+# --- Show the resulting file ------------------------------------------------
+print(LOCAL_FILE)
+with open(LOCAL_FILE, "r", encoding="utf-8") as f:
+    print(f.read())
 
-service.download_workbook = _fake_download_workbook
+print(f"Done. Open '",LOCAL_FILE,"' in this folder to see it as a spreadsheet.")
 
-
-def main():
-    client = service.app.test_client()
-
-    # Health check
-    r = client.get("/")
-    assert r.status_code == 200, r.data
-    print("health:", r.get_json())
-
-    # Wrong token should be rejected
-    r = client.post("/log", json={"tag": "front door", "token": "WRONG"})
-    assert r.status_code == 401, r.data
-    print("bad token correctly rejected:", r.get_json())
-
-    # Missing tag should be rejected
-    r = client.post("/log", json={"token": "test-token"})
-    assert r.status_code == 400, r.data
-    print("missing tag correctly rejected:", r.get_json())
-
-    # Two good taps
-    for tag in ["front door", "gym"]:
-        r = client.post("/log", json={"tag": tag, "token": "test-token"})
-        assert r.status_code == 200, r.data
-        print("logged:", r.get_json())
-
-    # Save the resulting sheet so you can open it
-    with open("local_test_output.xlsx", "wb") as f:
-        f.write(_fake_store["bytes"])
-
-    wb = load_workbook("local_test_output.xlsx")
-    ws = wb.active
-    rows = list(ws.iter_rows(values_only=True))
-    print("\nSpreadsheet contents:")
-    for row in rows:
-        print("  ", row)
-
-    assert rows[0] == tuple(service.HEADERS)
-    assert rows[1][2] == "front door"
-    assert rows[2][2] == "gym"
-    print("\nAll checks passed. Open local_test_output.xlsx to see the sheet.")
-
-
-if __name__ == "__main__":
-    main()

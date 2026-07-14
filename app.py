@@ -5,6 +5,17 @@
 import io
 import os
 from datetime import datetime, timezone
+# __ Configuration (read once at startup) ____________________________________
+HEADERS = ["timestamp_local", "s", "e"]
+DEFAULT_SOURCE = "NFC"                                                # If a request doesn't say where it came from, assume it was an NFC tap
+
+API_TOKEN = os.environ.get("API_TOKEN", "")                           # A secret you make up. Shortcuts must send it so strangers can't write to your sheet.
+DROPBOX_APP_KEY = os.environ.get("DROPBOX_APP_KEY", "")               # From the Dropbox App Console.
+DROPBOX_APP_SECRET = os.environ.get("DROPBOX_APP_SECRET", "")         # From the Dropbox App Console.
+DROPBOX_REFRESH_TOKEN = os.environ.get("DROPBOX_REFRESH_TOKEN", "")   # Produced once by running get_refresh_token.py.
+DROPBOX_FILE_PATH = os.environ.get("DROPBOX_FILE_PATH", "/log.csv")   # Where to store the CSV in Dropbox
+TIMEZONE = os.environ.get("TIMEZONE", "America/Chicago")              # IANA tz name for the local column. If not set, assume CST/CDT.
+
 
 try:
     # Python 3.9+ standard library
@@ -16,16 +27,6 @@ import dropbox
 from dropbox.files import WriteMode
 from flask import Flask, jsonify, request
 import csv
-
-# __ Configuration (read once at startup) ____________________________________
-API_TOKEN = os.environ.get("API_TOKEN", "")                                 # A secret you make up. Shortcuts must send it so strangers can't write to your sheet.
-DROPBOX_APP_KEY = os.environ.get("DROPBOX_APP_KEY", "")                     # From the Dropbox App Console.
-DROPBOX_APP_SECRET = os.environ.get("DROPBOX_APP_SECRET", "")               # From the Dropbox App Console.
-DROPBOX_REFRESH_TOKEN = os.environ.get("DROPBOX_REFRESH_TOKEN", "")         # Produced once by running get_refresh_token.py.
-DROPBOX_FILE_PATH = os.environ.get("DROPBOX_FILE_PATH", "/quick_log.csv")   # Where to store the CSV in Dropbox
-TIMEZONE = os.environ.get("TIMEZONE", "America/Chicago")                    # IANA tz name for the local column. If not set, assume CST/CDT.
-HEADERS = ["timestamp_utc", "timestamp_local", "s", "e", "a", "b", "c"]
-DEFAULT_SOURCE = "NFC"                                                      # If a request doesn't say where it came from, assume it was an NFC tap
 
 app = Flask(__name__)
 
@@ -77,37 +78,28 @@ def upload_rows(dbx, rows):
     )
 
 
-def append_row(event, source, tags, when_utc):
+def append_row(event, source, when_utc):
     """Append one row to the Dropbox CSV.
-
-    tags is a list of three strings [tag_1, tag_2, tag_3]; any of them may be "".
     """
     dbx = get_dropbox_client()
     rows = download_rows(dbx)
 
     # Keep the header row correct (also upgrades an older/short header).
-    if rows and rows[0] and rows[0][0] == "timestamp_utc":
+    if rows and rows[0] and rows[0][0] == "timestamp_local":
         rows[0] = HEADERS
     else:
         rows.insert(0, HEADERS)
 
     # Build the local-time string.
-    if ZoneInfo is not None:
-        try:
-            local_dt = when_utc.astimezone(ZoneInfo(TIMEZONE))
-        except Exception:
-            local_dt = when_utc
-    else:
-        local_dt = when_utc
+    timestamp_local = when_utc.astimezone(ZoneInfo(TIMEZONE))
 
-    # Column order must match HEADERS: utc, local, source, event, tag_1, tag_2, tag_3
+    # Column order must match HEADERS: timestamp_local, source, event
     rows.append([
-        when_utc.strftime("%Y-%m-%d %H:%M:%S"),
-        local_dt.strftime("%Y-%m-%d %H:%M:%S"),
+        timestamp_local.strftime("%Y-%m-%d %H:%M:%S"),
         source,
-        event,
-        tags[0], tags[1], tags[2],
+        event
     ])
+    rows[1:] = sorted(rows[1:], key=lambda row: row[0], reverse=True)
     upload_rows(dbx, rows)
 
 
@@ -117,16 +109,14 @@ def health():
     """Simple health check so you can confirm the service is running."""
     return jsonify({"status": "ok", "service": "nfc-dropbox-logger"})
 
-
 @app.route("/log", methods=["GET", "POST"])
 def log_event():
     """Receive an event and append a row to Dropbox.
     Accepts GET (handy for testing by pasting a URL in a browser) or POST.
     Values come from JSON body, form fields, OR the query string (?event=...):
-        token   (required)  must equal API_TOKEN
-        event   (required)  the event name, e.g. "Did a task"
-        source  (optional)  NFC / Voice / Text / Email ... (defaults to NFC)
-        tag_1, tag_2, tag_3 (optional) extra values, e.g. "Cost:$69.22"
+        token  (required)  must equal API_TOKEN
+        source (required)  NFC, Voice, Text, Email, etc.
+        event  (required)  "a blob I parse later"
     The token may also be sent as a query string (?token=...) or an
     "Authorization: Bearer <token>" header, whichever is easiest.
     """
@@ -154,20 +144,17 @@ def log_event():
     event = field("e")
     if not event:
         return jsonify({"error": "missing 'event'"}), 400
-
-    # Where did this come from? NFC / Voice / Text / Email / ...
-    # If the sender didn't say, assume NFC.
-    source = field("s") or DEFAULT_SOURCE
-
-    # Extra optional tags. If a tag wasn't sent, store an empty cell.
-    tag_1 = field("a") or ""
-    tag_2 = field("b") or ""
-    tag_3 = field("c") or ""
+    
+    # Where did this come from? NFC, Voice, Text, Email, etc.
+    # source = field("s") or DEFAULT_SOURCE # If the sender didn't say, assume NFC.
+    source = field("s")
+    if not source:
+        return jsonify({"error": "missing 'source'"}), 400
 
     when_utc = datetime.now(timezone.utc)
 
     try:
-        append_row(str(event), str(source), [tag_1, tag_2, tag_3], when_utc)
+        append_row(str(event), str(source), when_utc)
     except Exception as exc:  # noqa: BLE001 - report any failure to the caller
         return jsonify({"error": str(exc)}), 500
 
@@ -175,12 +162,11 @@ def log_event():
         "status": "logged",
         "event": event,
         "source": source,
-        "tags": [tag_1, tag_2, tag_3],
         "timestamp_utc": when_utc.strftime("%Y-%m-%d %H:%M:%S"),
     })
-
 
 if __name__ == "__main__":
     # Local development server. In production, gunicorn runs the app (see Procfile).
     port = int(os.environ.get("PORT", "8000"))
     app.run(host="0.0.0.0", port=port)
+
